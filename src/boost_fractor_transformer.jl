@@ -5,7 +5,7 @@
 #
 # Stefan Knirck
 #
-export transformer,calc_propagation_matrices,field2modes,modes2field, Modes, SeedModes, propagation_matrix
+export transformer,calc_propagation_matrices,field2modes,modes2field, Modes, SeedModes
 
 # Transformation Matrices
 using LinearAlgebra
@@ -506,17 +506,15 @@ function transformer_gradient(bdry::SetupBoundaries, coords::CoordinateSystem, m
         # T_s^m = T_{s+1}^m G_s P_s
         transmissionfunction_complete *= transmissionfunction_bdry
 
-        #if idx_reg(s)%2==0#skip derivative if s=dielectric
+        if idx_reg(s)%2==0#skip derivative if s=dielectric
             #insert ∂_k(G_k P_k) = iwn G_k sigma_3 P_k at correct position 
-        #    transmissionfunction_bdry_derivative = -1im*2pi/lambda*sqrt(bdry.eps[idx_reg(s)]) .* (transmissionfunction_bdry*block_pauli_3)#get_boundary_matrix_derivative(sqrt(bdry.eps[idx_reg(s)]), sqrt(bdry.eps[idx_reg(s+1)]), diffprop, modes) 
-        #    transmissionfunction_partials[2*(1:Ngaps).==idx_reg(s)] .*= [transmissionfunction_bdry_derivative]   
-
-        #end
+            transmissionfunction_bdry_derivative = -1im*2pi/lambda*sqrt(bdry.eps[idx_reg(s)]) .* (transmissionfunction_bdry*block_pauli_3)#get_boundary_matrix_derivative(sqrt(bdry.eps[idx_reg(s)]), sqrt(bdry.eps[idx_reg(s+1)]), diffprop, modes) 
+            transmissionfunction_partials[2*(1:Ngaps).==idx_reg(s)] .*= [transmissionfunction_bdry_derivative]   
+        end
         #other air gaps don't change
-        #transmissionfunction_partials[2*(1:Ngaps).!==idx_reg(s)] .*= [transmissionfunction_bdry]  
-        transmissionfunction_partials[2*(1:Ngaps).>=idx_reg(s)] .= [transmissionfunction_complete]
+        transmissionfunction_partials[2*(1:Ngaps).!==idx_reg(s)] .*= [transmissionfunction_bdry]  
+        #transmissionfunction_partials[2*(1:Ngaps).>=idx_reg(s)] .= [transmissionfunction_complete]
 
-        #axion_beam_partials[1:Ngaps .<= idx_reg(s)÷2] .+= [axion_contrib(transmissionfunction_partials[k], sqrt(bdry.eps[idx_reg(s+1)]), sqrt(bdry.eps[idx_reg(s)]), initial, modes) for k in 1:idx_reg(s)÷2]
         
         for k in 1:idx_reg(s)÷2#integer division is important
             #we only add those summands that contain ∂_k(G_k P_k) in their "T_s^m" 
@@ -542,12 +540,70 @@ function transformer_gradient(bdry::SetupBoundaries, coords::CoordinateSystem, m
         return boost, boost_grad
     end
 
-    refl = transmissionfunction_complete[index(modes,2),index(modes,2)] \
+    refl = -transmissionfunction_complete[index(modes,2),index(modes,2)] \
            ((transmissionfunction_complete[index(modes,2),index(modes,1)]) * (reflect))
     refl_grad = Array{Complex{Float64}}(zeros(Ngaps,(modes.M)*(2modes.L+1)))
     for k in 1:Ngaps
-        #refl_grad[k,:] = -(transmissionfunction_complete[index(modes,2),index(modes,2)]) \ (-transmissionfunction_partials[k][index(modes,2),index(modes,1)]*reflect .+ transmissionfunction_partials[k][index(modes,2),index(modes,2)]*refl)
-        refl_grad[k,:] = (transmissionfunction_complete[index(modes,2),index(modes,2)]^2) \ (-2*1im*2pi/lambda*(transmissionfunction_partials[k][index(modes,2),index(modes,2)]*transmissionfunction_partials[k][index(modes,2),index(modes,1)])*reflect)
+        refl_grad[k,:] = -(transmissionfunction_complete[index(modes,2),index(modes,2)]) \ (transmissionfunction_partials[k][index(modes,2),index(modes,1)]*reflect .+ transmissionfunction_partials[k][index(modes,2),index(modes,2)]*refl)
+        #refl_grad[k,:] = (transmissionfunction_complete[index(modes,2),index(modes,2)]^2) \ (-2*1im*2pi/lambda*(transmissionfunction_partials[k][index(modes,2),index(modes,2)]*transmissionfunction_partials[k][index(modes,2),index(modes,1)])*reflect)
     end
-    return boost, boost_grad, refl, refl_grad, transmissionfunction_complete, transmissionfunction_partials
+    return boost, boost_grad, refl, refl_grad
+end
+
+
+
+"""
+Transformer Algorithm using Transfer Matrices and Modes to do the 3D Calculation.
+"""
+function transformer_transfermatrices(bdry::SetupBoundaries, coords::CoordinateSystem, modes::Modes; f=10.0e9, velocity_x=0, prop=propagator, propagation_matrices::Array{Array{Complex{Float64},2},1}=Array{Complex{Float64},2}[], diskR=0.15, emit=axion_induced_modes(coords,modes;B=nothing,velocity_x=velocity_x,diskR=diskR), reflect=nothing)
+    # For the transformer the region of the mirror must contain a high dielectric constant,
+    # as the mirror is not explicitly taken into account
+    # To have same SetupBoundaries object for all codes and cheerleader assumes NaN, just define a high constant
+    bdry.eps[isnan.(bdry.eps)] .= 1e30
+    Nregions = length(bdry.eps) 
+
+    #Definitions
+    transmissionfunction_complete = [modes.id modes.zeromatrix ; modes.zeromatrix modes.id ]
+    transmissionfunction_partials = [[modes.id modes.zeromatrix ; modes.zeromatrix modes.id ] for k in 1:Nregions]
+    lambda = wavelength(f)
+
+
+    #=
+        To have the different algorithms consistent with each other,
+        we always assume that the mirror is at the left and we want to calculated
+        the boost factor / reflectivity /  ... on the right.
+        For the transfer matrices it is however more convenient to calcluate them
+        boost factor on the left (cf eq. 4.14a). Therefore, we use the following
+        little dummy function to "reindex" the SetupBoundaries arrays such that
+        we see it ordered the other way round.
+    =#
+    idx_reg(s) = Nregions-s+1
+
+    #=
+        Essentially we want to calculate 4.14a
+        We iteratively calculate the T matrices, in each step directly computing its axion contribution.
+        We calculate T_{m-1}^m first, and then expand iteratively to get T_{n}^m.
+        Notice from eq. (4.9) that going one region down is a multiplication from the right, not the left, e.g.
+        T_3^5 = T_4^5 G_3 P_3.
+    =#
+    for s in (Nregions-1):-1:1
+
+        # calculate T_s^m ---------------------------
+        # Propagation matrix (later become the subblocks of P)
+        diffprop = (isempty(propagation_matrices) ?
+                        propagation_matrix(bdry.distance[idx_reg(s)], diskR, bdry.eps[idx_reg(s)], bdry.relative_tilt_x[idx_reg(s)], bdry.relative_tilt_y[idx_reg(s)], bdry.relative_surfaces[idx_reg(s),:,:], lambda, coords, modes; prop=prop) :
+                        propagation_matrices[idx_reg(s)])
+
+        # G_s P_s
+        transmissionfunction_bdry = get_boundary_matrix(sqrt(bdry.eps[idx_reg(s)]), sqrt(bdry.eps[idx_reg(s+1)]), diffprop, modes)     
+        # T_s^m = T_{s+1}^m G_s P_s
+        transmissionfunction_complete *= transmissionfunction_bdry
+        #T_k^m 
+        transmissionfunction_partials[1:Nregions.>=idx_reg(s)] .= [transmissionfunction_complete]
+
+ 
+         
+    end
+
+   return transmissionfunction_partials
 end
